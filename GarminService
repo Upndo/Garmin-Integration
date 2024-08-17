@@ -1,0 +1,172 @@
+import 'dart:convert';
+import 'dart:math';
+import 'package:crypto/crypto.dart';
+import 'package:http/http.dart' as http;
+import 'package:url_launcher/url_launcher.dart';
+
+class GarminConnectService {
+  final String consumerKey = 'd4404694-961c-45cb-991c-d56501fd9816';
+  final String consumerSecret = 'B15dbuF5B082jaC5QY4WAsWZvfAlh9X18Rp';
+  String token = '';
+  String tokenSecret = '';
+
+  // Helper functions for OAuth
+
+  /// Generates a random nonce for OAuth authentication.
+  String generateNonce() {
+    final random = Random.secure();
+    final nonce = List<int>.generate(32, (_) => random.nextInt(256));
+    return base64Encode(nonce).replaceAll('=', '');
+  }
+
+  /// Generates an OAuth signature.
+  ///
+  /// [method] The HTTP method (e.g., POST, GET).
+  /// [url] The request URL.
+  /// [params] The parameters for the request.
+  /// [consumerSecret] The consumer secret for HMAC-SHA1.
+  /// [tokenSecret] The token secret for HMAC-SHA1.
+  String generateSignature(String method, Uri url, Map<String, String> params, String consumerSecret, String tokenSecret) {
+    final sortedParams = Map<String, String>.from(params)
+      ..addAll({
+        'oauth_consumer_key': consumerKey,
+        'oauth_token': token,
+        'oauth_signature_method': 'HMAC-SHA1',
+        'oauth_timestamp': (DateTime.now().millisecondsSinceEpoch / 1000).toString(),
+        'oauth_nonce': generateNonce(),
+        'oauth_version': '1.0'
+      })
+      ..removeWhere((key, value) => value.isEmpty);
+
+    final encodedParams = sortedParams.entries.map((e) => '${Uri.encodeComponent(e.key)}=${Uri.encodeComponent(e.value)}').join('&');
+    final baseString = '${method.toUpperCase()}&${Uri.encodeComponent(url.toString())}&${Uri.encodeComponent(encodedParams)}';
+    final signingKey = '${Uri.encodeComponent(consumerSecret)}&${Uri.encodeComponent(tokenSecret)}';
+    final signature = Hmac(sha1, utf8.encode(signingKey)).convert(utf8.encode(baseString)).toString();
+
+    return Uri.encodeComponent(signature);
+  }
+
+  /// Requests an OAuth request token.
+  ///
+  /// Returns a map containing the token data.
+  Future<Map<String, String>> getRequestToken() async {
+    final url = Uri.parse('https://connect.garmin.com/oauth-service/oauth/request_token');
+    final params = {
+      'oauth_signature_method': 'HMAC-SHA1',
+      'oauth_timestamp': (DateTime.now().millisecondsSinceEpoch / 1000).toString(),
+      'oauth_nonce': generateNonce(),
+      'oauth_version': '1.0'
+    };
+
+    final signature = generateSignature('POST', url, params, consumerSecret, '');
+    final response = await http.post(
+      url,
+      headers: {
+        'Authorization': 'OAuth oauth_version="1.0", '
+            'oauth_consumer_key="$consumerKey", '
+            'oauth_timestamp="${params['oauth_timestamp']}", '
+            'oauth_nonce="${params['oauth_nonce']}", '
+            'oauth_signature_method="HMAC-SHA1", '
+            'oauth_signature="$signature"',
+      },
+    );
+
+    print(response.headers);
+    print(response.statusCode);
+
+    if (response.statusCode == 200) {
+      return parseTokenData(response.body);
+    } else {
+      throw Exception('Failed to get request token: ${response.statusCode}, ${response.reasonPhrase}, ${response.body}');
+    }
+  }
+
+  /// Launches the URL for user authorization.
+  ///
+  /// [requestToken] The OAuth request token.
+  Future<void> authorizeUser(String requestToken) async {
+    final authorizationUrl = 'https://connect.garmin.com/oauth-service/oauth/authorize?oauth_token=$requestToken';
+    if (await canLaunch(authorizationUrl)) {
+      await launch(authorizationUrl);
+    } else {
+      throw 'Could not launch $authorizationUrl';
+    }
+  }
+
+  /// Requests an OAuth access token.
+  ///
+  /// [oauthToken] The OAuth request token.
+  /// [oauthVerifier] The OAuth verifier received after user authorization.
+  ///
+  /// Returns a map containing the token data.
+  Future<Map<String, String>> getAccessToken(String oauthToken, String oauthVerifier) async {
+    final url = Uri.parse('https://connect.garmin.com/oauth-service/oauth/access_token');
+    final params = {
+      'oauth_token': oauthToken,
+      'oauth_verifier': oauthVerifier,
+      'oauth_signature_method': 'HMAC-SHA1',
+      'oauth_timestamp': (DateTime.now().millisecondsSinceEpoch / 1000).toString(),
+      'oauth_nonce': generateNonce(),
+      'oauth_version': '1.0'
+    };
+
+    final signature = generateSignature('POST', url, params, consumerSecret, tokenSecret);
+    final response = await http.post(
+      url,
+      headers: {
+        'Authorization': 'OAuth oauth_version="1.0", '
+            'oauth_consumer_key="$consumerKey", '
+            'oauth_token="$oauthToken", '
+            'oauth_signature_method="HMAC-SHA1", '
+            'oauth_timestamp="${params['oauth_timestamp']}", '
+            'oauth_nonce="${params['oauth_nonce']}", '
+            'oauth_version="1.0", '
+            'oauth_signature="$signature"',
+      },
+    );
+
+    if (response.statusCode == 200) {
+      return parseTokenData(response.body);
+    } else {
+      throw Exception('Failed to get access token: ${response.statusCode}, ${response.reasonPhrase}, ${response.body}');
+    }
+  }
+
+  /// Retrieves the user ID using the OAuth access token.
+  ///
+  /// [accessToken] The OAuth access token.
+  ///
+  /// Returns the user ID.
+  Future<String> getUserId(String accessToken) async {
+    final response = await http.get(
+      Uri.parse('https://connect.garmin.com/modern/proxy/userprofile-service/userprofile'),
+      headers: {
+        'Authorization': 'Bearer $accessToken',
+      },
+    );
+
+    if (response.statusCode == 200) {
+      final Map<String, dynamic> userProfile = jsonDecode(response.body);
+      return userProfile['userId'];
+    } else {
+      throw Exception('Failed to get user ID: ${response.statusCode}, ${response.reasonPhrase}, ${response.body}');
+    }
+  }
+
+  /// Parses token data from the response body.
+  ///
+  /// [responseBody] The response body containing token data.
+  ///
+  /// Returns a map with token key-value pairs.
+  Map<String, String> parseTokenData(String responseBody) {
+    final Map<String, String> tokenData = {};
+    final pairs = responseBody.split('&');
+    for (var pair in pairs) {
+      final keyValue = pair.split('=');
+      if (keyValue.length == 2) {
+        tokenData[keyValue[0]] = keyValue[1];
+      }
+    }
+    return tokenData;
+  }
+}
