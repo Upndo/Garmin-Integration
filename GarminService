@@ -27,38 +27,67 @@ class GarminConnectService {
   /// [consumerSecret] The consumer secret for HMAC-SHA1.
   /// [tokenSecret] The token secret for HMAC-SHA1.
   String generateSignature(String method, Uri url, Map<String, String> params, String consumerSecret, String tokenSecret) {
-    final sortedParams = Map<String, String>.from(params)
-      ..addAll({
-        'oauth_consumer_key': consumerKey,
-        'oauth_token': token,
-        'oauth_signature_method': 'HMAC-SHA1',
-        'oauth_timestamp': (DateTime.now().millisecondsSinceEpoch / 1000).toString(),
-        'oauth_nonce': generateNonce(),
-        'oauth_version': '1.0'
-      })
-      ..removeWhere((key, value) => value.isEmpty);
+    // Add OAuth parameters
+    final oauthParams = {
+      'oauth_consumer_key': consumerKey,
+      'oauth_nonce': params['oauth_nonce']!,
+      'oauth_signature_method': 'HMAC-SHA1',
+      'oauth_timestamp': params['oauth_timestamp']!,
+      'oauth_version': '1.0',
+    };
 
-    final encodedParams = sortedParams.entries.map((e) => '${Uri.encodeComponent(e.key)}=${Uri.encodeComponent(e.value)}').join('&');
-    final baseString = '${method.toUpperCase()}&${Uri.encodeComponent(url.toString())}&${Uri.encodeComponent(encodedParams)}';
-    final signingKey = '${Uri.encodeComponent(consumerSecret)}&${Uri.encodeComponent(tokenSecret)}';
-    final signature = Hmac(sha1, utf8.encode(signingKey)).convert(utf8.encode(baseString)).toString();
+    // Combine all parameters
+    final allParams = {...params, ...oauthParams};
 
-    return Uri.encodeComponent(signature);
+    // Sort parameters
+    final sortedParams = allParams.entries
+        .map((e) => '${Uri.encodeComponent(e.key)}=${Uri.encodeComponent(e.value)}')
+        .toList()
+      ..sort();
+
+    final paramString = sortedParams.join('&');
+
+    // Create the signature base string
+    final baseString = '$method&${Uri.encodeComponent(url.toString())}&${Uri.encodeComponent(paramString)}';
+
+    // Create the signing key
+    final key = '${Uri.encodeComponent(consumerSecret)}&${Uri.encodeComponent(tokenSecret)}';
+
+    final hmac = Hmac(sha1, utf8.encode(key));
+    final digest = hmac.convert(utf8.encode(baseString));
+
+    return base64.encode(digest.bytes);
+  }
+
+  void debugPrintSignatureInfo(String method, Uri url, Map<String, String> params, String consumerSecret, String tokenSecret) {
+    final baseString = '$method&${Uri.encodeComponent(url.toString())}&${Uri.encodeComponent(params.entries.map((e) => '${Uri.encodeComponent(e.key)}=${Uri.encodeComponent(e.value)}').toList().join('&'))}';
+    final key = '${Uri.encodeComponent(consumerSecret)}&${Uri.encodeComponent(tokenSecret)}';
+
+    print('Base String: $baseString');
+    print('Signing Key: $key');
+
+    final signature = generateSignature(method, url, params, consumerSecret, tokenSecret);
+    print('Generated Signature: $signature');
   }
 
   /// Requests an OAuth request token.
   ///
   /// Returns a map containing the token data.
   Future<Map<String, String>> getRequestToken() async {
-    final url = Uri.parse('https://connect.garmin.com/oauth-service/oauth/request_token');
+    final url = Uri.parse('https://connectapi.garmin.com/oauth-service/oauth/request_token');
+
     final params = {
       'oauth_signature_method': 'HMAC-SHA1',
-      'oauth_timestamp': (DateTime.now().millisecondsSinceEpoch / 1000).toString(),
+      'oauth_timestamp': (DateTime.now().millisecondsSinceEpoch / 1000).toInt().toString(),
       'oauth_nonce': generateNonce(),
       'oauth_version': '1.0'
     };
 
     final signature = generateSignature('POST', url, params, consumerSecret, '');
+
+    // Debugging output
+    debugPrintSignatureInfo('POST', url, params, consumerSecret, '');
+
     final response = await http.post(
       url,
       headers: {
@@ -68,11 +97,9 @@ class GarminConnectService {
             'oauth_nonce="${params['oauth_nonce']}", '
             'oauth_signature_method="HMAC-SHA1", '
             'oauth_signature="$signature"',
+        'Content-Type': 'application/x-www-form-urlencoded',
       },
     );
-
-    print(response.headers);
-    print(response.statusCode);
 
     if (response.statusCode == 200) {
       return parseTokenData(response.body);
@@ -81,11 +108,13 @@ class GarminConnectService {
     }
   }
 
+
+
   /// Launches the URL for user authorization.
   ///
   /// [requestToken] The OAuth request token.
   Future<void> authorizeUser(String requestToken) async {
-    final authorizationUrl = 'https://connect.garmin.com/oauth-service/oauth/authorize?oauth_token=$requestToken';
+    final authorizationUrl = 'https://connect.garmin.com/oauthConfirm?oauth_token=$requestToken';
     if (await canLaunch(authorizationUrl)) {
       await launch(authorizationUrl);
     } else {
@@ -93,37 +122,72 @@ class GarminConnectService {
     }
   }
 
-  /// Requests an OAuth access token.
-  ///
-  /// [oauthToken] The OAuth request token.
-  /// [oauthVerifier] The OAuth verifier received after user authorization.
-  ///
-  /// Returns a map containing the token data.
+
+  String generateSignatureAccess(String method, Uri url, Map<String, String> params, String consumerSecret, String tokenSecret) {
+    final baseString = createBaseString(method, url, params);
+    final signingKey = '${Uri.encodeComponent(consumerSecret)}&${Uri.encodeComponent(tokenSecret)}';
+
+    final hmac = Hmac(sha1, utf8.encode(signingKey));
+    final digest = hmac.convert(utf8.encode(baseString));
+
+    return base64.encode(digest.bytes);
+  }
+
+  String createBaseString(String method, Uri url, Map<String, String> params) {
+    final sortedParams = params.entries.toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+    final paramString = sortedParams.map((e) => '${Uri.encodeComponent(e.key)}=${Uri.encodeComponent(e.value)}').join('&');
+
+    return '$method&${Uri.encodeComponent(url.toString().split('?').first)}&${Uri.encodeComponent(paramString)}';
+  }
+
+  String generateNonceAccess() {
+    final random = Random.secure();
+    final values = List<int>.generate(16, (i) => random.nextInt(256));
+    return base64Url.encode(values);
+  }
+
   Future<Map<String, String>> getAccessToken(String oauthToken, String oauthVerifier) async {
-    final url = Uri.parse('https://connect.garmin.com/oauth-service/oauth/access_token');
+    final url = Uri.parse('https://connectapi.garmin.com/oauth-service/oauth/access_token');
+
     final params = {
+      'oauth_signature_method': 'HMAC-SHA1',
+      'oauth_timestamp': (DateTime.now().millisecondsSinceEpoch / 1000).toInt().toString(),
+      'oauth_nonce': generateNonceAccess(),
+      'oauth_version': '1.0',
       'oauth_token': oauthToken,
       'oauth_verifier': oauthVerifier,
-      'oauth_signature_method': 'HMAC-SHA1',
-      'oauth_timestamp': (DateTime.now().millisecondsSinceEpoch / 1000).toString(),
-      'oauth_nonce': generateNonce(),
-      'oauth_version': '1.0'
     };
 
-    final signature = generateSignature('POST', url, params, consumerSecret, tokenSecret);
+    print("Params: $params");
+
+    final signature = generateSignatureAccess('POST', url, params, consumerSecret, tokenSecret);
+
+    print("OAuth Token: $oauthToken");
+    print("OAuth Verifier: $oauthVerifier");
+    print("Generated Signature: $signature");
+
+    final authorizationHeader = 'OAuth oauth_version="1.0", '
+        'oauth_consumer_key="$consumerKey", '
+        'oauth_token="$oauthToken", '
+        'oauth_signature_method="HMAC-SHA1", '
+        'oauth_timestamp="${params['oauth_timestamp']}", '
+        'oauth_nonce="${params['oauth_nonce']}", '
+        'oauth_signature="$signature"';
+
+    print("Authorization Header: $authorizationHeader");
+
     final response = await http.post(
       url,
       headers: {
-        'Authorization': 'OAuth oauth_version="1.0", '
-            'oauth_consumer_key="$consumerKey", '
-            'oauth_token="$oauthToken", '
-            'oauth_signature_method="HMAC-SHA1", '
-            'oauth_timestamp="${params['oauth_timestamp']}", '
-            'oauth_nonce="${params['oauth_nonce']}", '
-            'oauth_version="1.0", '
-            'oauth_signature="$signature"',
+        'Authorization': authorizationHeader,
+        'Content-Type': 'application/x-www-form-urlencoded',
       },
+      body: 'oauth_token=$oauthToken&oauth_verifier=$oauthVerifier',
     );
+
+    print("Response Status: ${response.statusCode}");
+    print("Response Body: ${response.body}");
 
     if (response.statusCode == 200) {
       return parseTokenData(response.body);
@@ -132,6 +196,8 @@ class GarminConnectService {
     }
   }
 
+
+
   /// Retrieves the user ID using the OAuth access token.
   ///
   /// [accessToken] The OAuth access token.
@@ -139,7 +205,7 @@ class GarminConnectService {
   /// Returns the user ID.
   Future<String> getUserId(String accessToken) async {
     final response = await http.get(
-      Uri.parse('https://connect.garmin.com/modern/proxy/userprofile-service/userprofile'),
+      Uri.parse('https://apis.garmin.com/wellness-api/rest/user/id'),
       headers: {
         'Authorization': 'Bearer $accessToken',
       },
